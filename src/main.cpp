@@ -3,6 +3,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <LittleFS.h>
 #include <algorithm>
 #include <vector>
 #include <map>
@@ -41,7 +42,7 @@ enum AppView {
 static AppView current_view = VIEW_MENU;
 
 // ── Search mode that produced the current list ──────────────────────────
-enum SearchMode { SEARCH_NEAR, SEARCH_LONG, SEARCH_CITY, SEARCH_CARRIER, SEARCH_TEXT };
+enum SearchMode { SEARCH_NEAR, SEARCH_CITY, SEARCH_CARRIER, SEARCH_TEXT };
 static SearchMode search_mode = SEARCH_NEAR;
 
 // ── Global state ────────────────────────────────────────────────────────
@@ -86,6 +87,7 @@ static Preferences prefs;
 
 // ── Forward declarations ────────────────────────────────────────────────
 // WiFi
+bool promptWiFiChoice();
 void wifiScanAndConnect();
 String keyboardInput(const char* prompt, bool is_password = false);
 bool connectWiFi(const String& ssid, const String& pass);
@@ -108,6 +110,13 @@ void handleCarrierPickInput(Keyboard_Class::KeysState& keys);
 void handleListInput(Keyboard_Class::KeysState& keys);
 void handleDetailInput(Keyboard_Class::KeysState& keys);
 void handleMapInput(Keyboard_Class::KeysState& keys);
+
+// City picker
+struct CityEntry { const Airport* apt; int count; };
+static std::vector<CityEntry> city_entries;
+static std::vector<CityEntry> city_filtered;
+void buildCityList();
+void filterCityEntries(const String& filter, std::vector<CityEntry>& out);
 
 // Drawing
 void drawHeader(const char* title, const char* right = nullptr);
@@ -139,14 +148,58 @@ void setup() {
     drawCentered("v2.0", 45, C_DIM);
     delay(600);
 
+    LittleFS.begin(true);
     prefs.begin(NVS_NAMESPACE, false);
-    loadSavedWiFi();
 
+    bool chooseDifferent = promptWiFiChoice();
+    if (!chooseDifferent) {
+        loadSavedWiFi();
+    }
     if (!wifi_connected) {
         wifiScanAndConnect();
     }
 
     if (wifi_connected) {
+        char dbg[40];
+
+        M5Cardputer.Display.fillScreen(C_BG);
+        snprintf(dbg, sizeof(dbg), "Heap:%dk PSRAM:%dk", ESP.getFreeHeap()/1024, ESP.getFreePsram()/1024);
+        drawCentered(dbg, 20, C_DIM);
+        drawCentered("Loading airlines...", 40, C_DIM);
+
+        if (!loadAirlinesFromFile()) {
+            drawCentered("Fetching from web...", 55, C_DIM);
+            if (!fetchAirlines()) {
+                drawCentered("AIRLINE FETCH FAILED", 70, TFT_RED);
+                snprintf(dbg, sizeof(dbg), "Heap:%dk PSRAM:%dk", ESP.getFreeHeap()/1024, ESP.getFreePsram()/1024);
+                drawCentered(dbg, 85, TFT_RED);
+                delay(5000);
+            }
+        }
+
+        snprintf(dbg, sizeof(dbg), "Airlines: %d", getAirlineCount());
+        drawCentered(dbg, 70, C_AIRBORNE);
+        delay(500);
+
+        M5Cardputer.Display.fillScreen(C_BG);
+        snprintf(dbg, sizeof(dbg), "Heap:%dk PSRAM:%dk", ESP.getFreeHeap()/1024, ESP.getFreePsram()/1024);
+        drawCentered(dbg, 20, C_DIM);
+        drawCentered("Loading airports...", 40, C_DIM);
+
+        if (!loadAirportsFromFile()) {
+            drawCentered("Fetching from web...", 55, C_DIM);
+            if (!fetchAirports()) {
+                drawCentered("AIRPORT FETCH FAILED", 70, TFT_RED);
+                snprintf(dbg, sizeof(dbg), "Heap:%dk PSRAM:%dk", ESP.getFreeHeap()/1024, ESP.getFreePsram()/1024);
+                drawCentered(dbg, 85, TFT_RED);
+                delay(5000);
+            }
+        }
+
+        snprintf(dbg, sizeof(dbg), "Airports: %d", getAirportCount());
+        drawCentered(dbg, 70, C_AIRBORNE);
+        delay(500);
+
         current_view = VIEW_MENU;
         drawMenu();
     }
@@ -192,20 +245,39 @@ void loop() {
 //  WIFI
 // ════════════════════════════════════════════════════════════════════════
 
+// Returns true if user wants to use a different network
+bool promptWiFiChoice() {
+    String ssid = prefs.getString("ssid", "");
+    if (ssid.length() == 0) return true; // no saved WiFi, must pick
+
+    M5Cardputer.Display.fillScreen(C_BG);
+    drawCentered("Saved WiFi:", 30, C_DIM);
+    drawCentered(ssid.c_str(), 48, C_ACCENT);
+    drawCentered("Enter=connect  Any=new WiFi", 80, C_DIM);
+
+    unsigned long timeout = millis() + 3000; // auto-connect after 3s
+    while (millis() < timeout) {
+        M5Cardputer.update();
+        if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+            Keyboard_Class::KeysState k = M5Cardputer.Keyboard.keysState();
+            if (k.enter) return false;      // use saved
+            return true;                     // any other key = pick new
+        }
+        delay(50);
+    }
+    return false; // timeout = use saved
+}
+
 void loadSavedWiFi() {
     String ssid = prefs.getString("ssid", "");
     String pass = prefs.getString("pass", "");
     if (ssid.length() == 0) return;
 
     M5Cardputer.Display.fillScreen(C_BG);
-    drawCentered("Saved WiFi...", 45, C_DIM);
+    drawCentered("Connecting...", 45, C_DIM);
     drawCentered(ssid.c_str(), 60, C_ACCENT);
 
     wifi_connected = connectWiFi(ssid, pass);
-    if (wifi_connected) {
-        drawCentered("Connected!", 80, C_AIRBORNE);
-        delay(400);
-    }
 }
 
 void wifiScanAndConnect() {
@@ -506,11 +578,11 @@ void buildCarrierList() {
 
     carriers.clear();
     // Include ALL known airlines from database
-    for (int i = 0; i < AIRLINE_COUNT; i++) {
+    for (int i = 0; i < getAirlineCount(); i++) {
         CarrierInfo ci;
-        strncpy(ci.code, AIRLINES[i].icao, 3);
+        strncpy(ci.code, airlines[i].icao, 3);
         ci.code[3] = '\0';
-        ci.name = AIRLINES[i].name;
+        ci.name = airlines[i].name;
         auto it = counts.find(String(ci.code));
         ci.count = (it != counts.end()) ? it->second : 0;
         carriers.push_back(ci);
@@ -518,8 +590,8 @@ void buildCarrierList() {
     // Also add any active carriers not in our database
     for (auto& kv : counts) {
         bool found = false;
-        for (int i = 0; i < AIRLINE_COUNT; i++) {
-            if (kv.first == AIRLINES[i].icao) { found = true; break; }
+        for (int i = 0; i < getAirlineCount(); i++) {
+            if (kv.first == airlines[i].icao) { found = true; break; }
         }
         if (!found) {
             CarrierInfo ci;
@@ -592,14 +664,25 @@ void filterByText(const String& query) {
 
 static const char* MENU_ITEMS[] = {
     "Near Me",
-    "Long Flights",
     "By City",
     "By Carrier",
-    "Search"
+    "Search",
+    "Refresh Data"
 };
 static const int MENU_COUNT = 5;
 
 void doSearch(SearchMode mode);
+
+void refreshData() {
+    M5Cardputer.Display.fillScreen(C_BG);
+    drawCentered("Refreshing airlines...", 40, C_DIM);
+    fetchAirlines();
+    drawCentered("Refreshing airports...", 60, C_DIM);
+    fetchAirports();
+    drawCentered("Done!", 80, C_AIRBORNE);
+    delay(500);
+    drawMenu();
+}
 
 void handleMenuInput(Keyboard_Class::KeysState& keys) {
     bool redraw = false;
@@ -612,8 +695,13 @@ void handleMenuInput(Keyboard_Class::KeysState& keys) {
             wifiScanAndConnect();
             redraw = true;
         }
+        if (key == 'r' || key == 'R') {
+            refreshData();
+            return;
+        }
     }
     if (keys.enter) {
+        if (menu_cursor == 4) { refreshData(); return; }
         doSearch((SearchMode)menu_cursor);
         return;
     }
@@ -639,24 +727,15 @@ void doSearch(SearchMode mode) {
         fetchVisibleRoutes();
         break;
 
-    case SEARCH_LONG:
-        // Fetch large area, sort by altitude (proxy for long-haul)
+    case SEARCH_CITY:
+        // Fetch flights first so we can show counts per city
         if (!fetchFlightsInArea(observer_lat, observer_lon, RADIUS_WIDE)) {
             drawCentered("Fetch failed!", 65, TFT_RED);
             delay(1000);
             drawMenu();
             return;
         }
-        // Sort by altitude descending (high altitude = long haul)
-        std::sort(all_flights.begin(), all_flights.end(),
-                  [](const Flight& a, const Flight& b) { return a.altitude > b.altitude; });
-        flights.clear();
-        for (int i = 0; i < min((int)all_flights.size(), MAX_LIST_FLIGHTS); i++)
-            flights.push_back(all_flights[i]);
-        fetchVisibleRoutes();
-        break;
-
-    case SEARCH_CITY:
+        buildCityList();
         city_cursor = 0;
         city_scroll = 0;
         city_filter = "";
@@ -665,7 +744,13 @@ void doSearch(SearchMode mode) {
         return;
 
     case SEARCH_CARRIER:
-        // Build carrier list from known airlines + any cached flights
+        // Fetch flights first, then build carrier list with counts
+        if (!fetchFlightsInArea(observer_lat, observer_lon, RADIUS_WIDE)) {
+            drawCentered("Fetch failed!", 65, TFT_RED);
+            delay(1000);
+            drawMenu();
+            return;
+        }
         buildCarrierList();
         carrier_cursor = 0;
         carrier_scroll = 0;
@@ -714,13 +799,8 @@ void doSearch(SearchMode mode) {
 
 void handleCityPickInput(Keyboard_Class::KeysState& keys) {
     bool redraw = false;
-    int total = AIRPORT_COUNT;
-
-    // Filter changes total
-    const Airport* filtered[AIRPORT_COUNT];
-    if (city_filter.length() > 0) {
-        total = searchAirports(city_filter.c_str(), filtered, AIRPORT_COUNT);
-    }
+    filterCityEntries(city_filter, city_filtered);
+    int total = (int)city_filtered.size();
 
     for (auto key : keys.word) {
         if ((key == ';' || key == ',') && city_cursor > 0) {
@@ -757,12 +837,7 @@ void handleCityPickInput(Keyboard_Class::KeysState& keys) {
     }
 
     if (keys.enter && total > 0) {
-        const Airport* apt;
-        if (city_filter.length() > 0) {
-            apt = filtered[city_cursor];
-        } else {
-            apt = &AIRPORTS[city_cursor];
-        }
+        const Airport* apt = city_filtered[city_cursor].apt;
 
         M5Cardputer.Display.fillScreen(C_BG);
         char msg[40];
@@ -778,7 +853,6 @@ void handleCityPickInput(Keyboard_Class::KeysState& keys) {
         flights.clear();
         for (int i = 0; i < min((int)all_flights.size(), MAX_LIST_FLIGHTS); i++)
             flights.push_back(all_flights[i]);
-        fetchVisibleRoutes();
 
         cursor = 0; scroll_offset = 0; selected_flight = -1;
         show_routes = false; last_route_page = -1;
@@ -850,19 +924,8 @@ void handleCarrierPickInput(Keyboard_Class::KeysState& keys) {
     }
     if (keys.enter && total > 0) {
         int real_idx = filtered[carrier_cursor];
-        M5Cardputer.Display.fillScreen(C_BG);
-        char msg[40];
-        snprintf(msg, sizeof(msg), "Fetching %s flights...",
-                 carriers[real_idx].name ? carriers[real_idx].name : carriers[real_idx].code);
-        drawCentered(msg, 45, C_DIM);
 
-        // Fetch flights in wide area, then filter to this carrier
-        if (!fetchFlightsInArea(observer_lat, observer_lon, RADIUS_WIDE)) {
-            drawCentered("Fetch failed!", 65, TFT_RED);
-            delay(1000);
-            drawCarrierPicker();
-            return;
-        }
+        // Filter from already-fetched all_flights (fetched when entering carrier picker)
         filterByCarrier(carriers[real_idx].code);
 
         cursor = 0; scroll_offset = 0; selected_flight = -1;
@@ -1057,10 +1120,10 @@ void drawMenu() {
     int y = 22;
     const char* descs[] = {
         "250mi radius",
-        "Long flights",
         "Select an airport",
         "Filter by airline",
-        ""
+        "",
+        "Update from web"
     };
 
     for (int i = 0; i < MENU_COUNT; i++) {
@@ -1079,24 +1142,61 @@ void drawMenu() {
         y += 20;
     }
 
-    drawStatusBar(";.=nav Enter=select W=wifi");
+    drawStatusBar(";.=nav Enter=select W=wifi R=refresh");
 }
 
 // ════════════════════════════════════════════════════════════════════════
 //  CITY PICKER
 // ════════════════════════════════════════════════════════════════════════
 
+// Count flights near each airport from all_flights (using RADIUS_CITY)
+void buildCityList() {
+    city_entries.clear();
+    for (int i = 0; i < getAirportCount(); i++) {
+        const Airport* a = getAirport(i);
+        int cnt = 0;
+        for (auto& f : all_flights) {
+            float dlat = f.latitude - a->lat;
+            float dlon = f.longitude - a->lon;
+            if (dlat > -RADIUS_CITY && dlat < RADIUS_CITY &&
+                dlon > -RADIUS_CITY && dlon < RADIUS_CITY) {
+                cnt++;
+            }
+        }
+        city_entries.push_back({a, cnt});
+    }
+    // Sort by flight count descending, then alphabetical
+    std::sort(city_entries.begin(), city_entries.end(),
+              [](const CityEntry& a, const CityEntry& b) {
+                  if (a.count != b.count) return a.count > b.count;
+                  return strcmp(a.apt->city, b.apt->city) < 0;
+              });
+}
+
+void filterCityEntries(const String& filter, std::vector<CityEntry>& out) {
+    out.clear();
+    if (filter.length() == 0) {
+        out = city_entries;
+        return;
+    }
+    String q = filter;
+    q.toLowerCase();
+    for (auto& ce : city_entries) {
+        String city_s = String(ce.apt->city);
+        city_s.toLowerCase();
+        String icao_s = String(ce.apt->icao);
+        icao_s.toLowerCase();
+        if (city_s.indexOf(q) >= 0 || icao_s.indexOf(q) >= 0) {
+            out.push_back(ce);
+        }
+    }
+}
+
 void drawCityPicker() {
     M5Cardputer.Display.fillScreen(C_BG);
 
-    const Airport* list[AIRPORT_COUNT];
-    int total;
-    if (city_filter.length() > 0) {
-        total = searchAirports(city_filter.c_str(), list, AIRPORT_COUNT);
-    } else {
-        total = AIRPORT_COUNT;
-        for (int i = 0; i < total; i++) list[i] = &AIRPORTS[i];
-    }
+    filterCityEntries(city_filter, city_filtered);
+    int total = (int)city_filtered.size();
 
     char hdr[32];
     snprintf(hdr, sizeof(hdr), "Select City (%d)", total);
@@ -1117,7 +1217,16 @@ void drawCityPicker() {
         if (hl) M5Cardputer.Display.fillRect(0, y - 1, SCREEN_W, 16, C_SEL);
         M5Cardputer.Display.setTextColor(hl ? C_ACCENT : C_TEXT, hl ? C_SEL : C_BG);
         M5Cardputer.Display.setCursor(4, y);
-        M5Cardputer.Display.printf("%-4s  %s", list[i]->icao, list[i]->city);
+        M5Cardputer.Display.printf("%-4s %s", city_filtered[i].apt->icao, city_filtered[i].apt->city);
+        // Flight count on right side
+        if (city_filtered[i].count > 0) {
+            M5Cardputer.Display.setTextColor(C_AIRBORNE, hl ? C_SEL : C_BG);
+            char cnt[8];
+            snprintf(cnt, sizeof(cnt), "%d", city_filtered[i].count);
+            int cw = strlen(cnt) * 6;
+            M5Cardputer.Display.setCursor(SCREEN_W - cw - 4, y);
+            M5Cardputer.Display.print(cnt);
+        }
         y += 17;
     }
 

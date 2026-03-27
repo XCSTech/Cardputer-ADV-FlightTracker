@@ -1,118 +1,148 @@
 #pragma once
 
+#include <vector>
+#include <LittleFS.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+
+// OpenFlights airlines.dat — CSV (no header):
+// id,name,alias,iata,icao,callsign,country,active
+
+#define AIRLINES_URL "https://raw.githubusercontent.com/jpatokal/openflights/master/data/airlines.dat"
+#define AIRLINES_CACHE "/airlines.csv"
+
 struct Airline {
-    const char* icao;   // 3-letter ICAO designator
-    const char* name;   // Short display name
+    char icao[4];   // 3-letter ICAO designator
+    char name[24];  // Short display name
 };
 
-static const Airline AIRLINES[] = {
-    // ── US / Canada ─────────────────────────────────────────────────────
-    {"AAL", "American"},
-    {"DAL", "Delta"},
-    {"UAL", "United"},
-    {"SWA", "Southwest"},
-    {"JBU", "JetBlue"},
-    {"NKS", "Spirit"},
-    {"FFT", "Frontier"},
-    {"ASA", "Alaska"},
-    {"HAL", "Hawaiian"},
-    {"SKW", "SkyWest"},
-    {"RPA", "Republic"},
-    {"ENY", "Envoy Air"},
-    {"PDT", "Piedmont"},
-    {"PSA", "PSA Airlines"},
-    {"MES", "Mesa"},
-    {"ACA", "Air Canada"},
-    {"WJA", "WestJet"},
+static std::vector<Airline> airlines;
 
-    // ── Europe ──────────────────────────────────────────────────────────
-    {"BAW", "British Airways"},
-    {"DLH", "Lufthansa"},
-    {"AFR", "Air France"},
-    {"KLM", "KLM"},
-    {"EZY", "easyJet"},
-    {"RYR", "Ryanair"},
-    {"VLG", "Vueling"},
-    {"IBE", "Iberia"},
-    {"SAS", "SAS"},
-    {"FIN", "Finnair"},
-    {"AZA", "ITA Airways"},
-    {"SWR", "Swiss"},
-    {"AUA", "Austrian"},
-    {"TAP", "TAP Portugal"},
-    {"THA", "THAI"},
-    {"LOT", "LOT Polish"},
-    {"CSA", "Czech Airlines"},
-    {"AEE", "Aegean"},
-    {"THY", "Turkish"},
-    {"AFL", "Aeroflot"},
-    {"WZZ", "Wizz Air"},
-    {"EWG", "Eurowings"},
-    {"BEL", "Brussels"},
-    {"NAX", "Norwegian"},
-    {"ICE", "Icelandair"},
-    {"EIN", "Aer Lingus"},
+// Parse a possibly-quoted CSV field, advance pos past the delimiter
+static inline String parseCSVField(const String& line, int& pos) {
+    if (pos >= (int)line.length()) return "";
+    String result;
+    if (line[pos] == '"') {
+        pos++;
+        while (pos < (int)line.length()) {
+            if (line[pos] == '"') {
+                pos++;
+                if (pos < (int)line.length() && line[pos] == '"') {
+                    result += '"';
+                    pos++;
+                } else break;
+            } else {
+                result += line[pos++];
+            }
+        }
+        if (pos < (int)line.length() && line[pos] == ',') pos++;
+    } else {
+        int start = pos;
+        while (pos < (int)line.length() && line[pos] != ',') pos++;
+        result = line.substring(start, pos);
+        if (pos < (int)line.length()) pos++;
+    }
+    return result;
+}
 
-    // ── Middle East / Africa ────────────────────────────────────────────
-    {"UAE", "Emirates"},
-    {"ETD", "Etihad"},
-    {"QTR", "Qatar"},
-    {"SVA", "Saudia"},
-    {"MEA", "MEA"},
-    {"ELY", "El Al"},
-    {"MSR", "EgyptAir"},
-    {"ETH", "Ethiopian"},
-    {"SAA", "South African"},
-    {"RAM", "Royal Air Maroc"},
-    {"KQA", "Kenya Airways"},
+// Load from cached LittleFS file (icao,name per line)
+inline bool loadAirlinesFromFile() {
+    airlines.clear();
+    File f = LittleFS.open(AIRLINES_CACHE, "r");
+    if (!f) return false;
 
-    // ── Asia-Pacific ────────────────────────────────────────────────────
-    {"CPA", "Cathay Pacific"},
-    {"SIA", "Singapore"},
-    {"MAS", "Malaysia"},
-    {"ANA", "ANA"},
-    {"JAL", "JAL"},
-    {"KAL", "Korean Air"},
-    {"AAR", "Asiana"},
-    {"CCA", "Air China"},
-    {"CES", "China Eastern"},
-    {"CSN", "China Southern"},
-    {"HDA", "Hainan"},
-    {"GIA", "Garuda"},
-    {"PAL", "Philippine"},
-    {"VNM", "Vietnam"},
-    {"AIQ", "AirAsia"},
-    {"EVA", "EVA Air"},
-    {"CAL", "China Airlines"},
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) continue;
+        int comma = line.indexOf(',');
+        if (comma < 0) continue;
 
-    // ── Oceania ─────────────────────────────────────────────────────────
-    {"QFA", "Qantas"},
-    {"ANZ", "Air New Zealand"},
-    {"VOZ", "Virgin Aus"},
-    {"JST", "Jetstar"},
+        Airline a;
+        strncpy(a.icao, line.substring(0, comma).c_str(), sizeof(a.icao) - 1);
+        a.icao[sizeof(a.icao) - 1] = '\0';
+        strncpy(a.name, line.substring(comma + 1).c_str(), sizeof(a.name) - 1);
+        a.name[sizeof(a.name) - 1] = '\0';
+        airlines.push_back(a);
+    }
+    f.close();
+    return airlines.size() > 0;
+}
 
-    // ── Latin America ───────────────────────────────────────────────────
-    {"TAM", "LATAM Brasil"},
-    {"LAN", "LATAM Chile"},
-    {"AVA", "Avianca"},
-    {"CMP", "Copa"},
-    {"AMX", "Aeromexico"},
-    {"VIV", "VivaAerobus"},
-    {"GLO", "GOL"},
+// Fetch from OpenFlights API — stream-parse, write cache, build vector in one pass
+inline bool fetchAirlines() {
+    airlines.clear();
+    airlines.reserve(1500);
 
-    // ── Cargo ───────────────────────────────────────────────────────────
-    {"FDX", "FedEx"},
-    {"UPS", "UPS"},
-    {"GTI", "Atlas Air"},
-    {"ABX", "ABX Air"},
-    {"CLX", "Cargolux"},
-};
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.setTimeout(15000);
 
-static const int AIRLINE_COUNT = sizeof(AIRLINES) / sizeof(AIRLINES[0]);
+    if (!http.begin(client, AIRLINES_URL)) return false;
+    int code = http.GET();
+    if (code != 200) { http.end(); return false; }
+
+    File cache = LittleFS.open(AIRLINES_CACHE, "w");
+
+    int total = http.getSize();
+    int consumed = 0;
+    WiFiClient* stream = http.getStreamPtr();
+
+    while ((total == -1 || consumed < total) &&
+           (stream->available() || stream->connected())) {
+
+        if (!stream->available()) { delay(1); continue; }
+
+        char buf[256];
+        int len = 0;
+        while (len < (int)sizeof(buf) - 1) {
+            int c = stream->read();
+            if (c < 0) break;
+            consumed++;
+            if (c == '\n') break;
+            buf[len++] = (char)c;
+        }
+        buf[len] = '\0';
+        if (len == 0) continue;
+
+        String line(buf);
+        int pos = 0;
+        parseCSVField(line, pos);                        // 0: id
+        String name = parseCSVField(line, pos);          // 1: name
+        parseCSVField(line, pos);                        // 2: alias
+        parseCSVField(line, pos);                        // 3: iata
+        String icao = parseCSVField(line, pos);          // 4: icao
+        parseCSVField(line, pos);                        // 5: callsign
+        parseCSVField(line, pos);                        // 6: country
+        String active = parseCSVField(line, pos);        // 7: active
+
+        if (icao.length() != 3 || icao == "\\N" || icao == "-") continue;
+        if (active != "Y") continue;
+
+        Airline a;
+        strncpy(a.icao, icao.c_str(), sizeof(a.icao) - 1);
+        a.icao[sizeof(a.icao) - 1] = '\0';
+        strncpy(a.name, name.c_str(), sizeof(a.name) - 1);
+        a.name[sizeof(a.name) - 1] = '\0';
+        airlines.push_back(a);
+
+        if (cache) {
+            cache.print(a.icao);
+            cache.print(',');
+            cache.println(a.name);
+        }
+    }
+    if (cache) cache.close();
+    http.end();
+    return airlines.size() > 0;
+}
+
+inline int getAirlineCount() { return (int)airlines.size(); }
 
 inline const char* findAirlineName(const char* icao_prefix) {
-    for (int i = 0; i < AIRLINE_COUNT; i++) {
-        if (strcmp(AIRLINES[i].icao, icao_prefix) == 0) return AIRLINES[i].name;
+    for (auto& a : airlines) {
+        if (strcmp(a.icao, icao_prefix) == 0) return a.name;
     }
     return nullptr;
 }
